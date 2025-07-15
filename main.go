@@ -79,18 +79,26 @@ func main() {
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
 
-func enableCORS(w *http.ResponseWriter) {
-	(*w).Header().Set("Access-Control-Allow-Origin", "http://localhost:6969") // Your frontend origin
-	(*w).Header().Set("Access-Control-Allow-Methods", "GET")
+func enableCORS(w http.ResponseWriter, r *http.Request) {
+	origin := r.Header.Get("Origin")
+	allowed := map[string]bool{
+		"http://localhost:6969":     true,
+		"https://protekcyber.co.uk": true,
+	}
+
+	if allowed[origin] {
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+		w.Header().Set("Access-Control-Allow-Methods", "GET")
+	}
 }
 
 func threatsHandler(w http.ResponseWriter, r *http.Request) {
 	// Handle CORS preflight
 	if r.Method == "OPTIONS" {
+		enableCORS(w, r)
 		w.WriteHeader(http.StatusOK)
 		return
 	}
-	enableCORS(&w)
 
 	// Refresh data if cache is stale (>1 hour old)
 	if time.Since(cache.timestamp) > time.Hour {
