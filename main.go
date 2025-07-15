@@ -94,8 +94,8 @@ func enableCORS(w http.ResponseWriter, r *http.Request) {
 
 func threatsHandler(w http.ResponseWriter, r *http.Request) {
 	// Handle CORS preflight
+	enableCORS(w, r)
 	if r.Method == "OPTIONS" {
-		enableCORS(w, r)
 		w.WriteHeader(http.StatusOK)
 		return
 	}
