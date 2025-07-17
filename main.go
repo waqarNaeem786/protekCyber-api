@@ -12,6 +12,37 @@ import (
 	"time"
 )
 
+// CVE represents the structure expected by the frontend CVE Tracker
+type CVE struct {
+	CVEID       string  `json:"cve_id"`
+	Vendor      string  `json:"vendor"`
+	Product     string  `json:"product"`
+	Description string  `json:"description"`
+	Published   string  `json:"published"`
+	CVSS        float64 `json:"cvss"`
+	Severity    string  `json:"severity"`
+	Status      string  `json:"status"`
+}
+
+// Cache for CVE data
+var cveCache = struct {
+	data      []CVE
+	timestamp time.Time
+}{}
+
+var mockCVEs = []CVE{
+	{
+		CVEID:       "CVE-2025-0001",
+		Vendor:      "unknown",
+		Product:     "Unknown Product",
+		Description: "Placeholder CVE due to API unavailability",
+		Published:   time.Now().Format("2006-01-02"),
+		CVSS:        0.0,
+		Severity:    "low",
+		Status:      "none",
+	},
+}
+
 // Threat represents the frontend-expected structure
 type Pulse struct {
 	Name            string   `json:"name"`
@@ -85,6 +116,7 @@ func main() {
 	http.HandleFunc("/api/threats", threatsHandler)
 	http.HandleFunc("/health", healthCheck)
 	http.HandleFunc("/api/threat-explorer/", threatExplorerHandler)
+	http.HandleFunc("/api/cves", cvesHandler)
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
@@ -529,5 +561,250 @@ func getFallbackData(category string) map[string]interface{} {
 			"Cloud targeting",
 		},
 		"title": time.Now().Format("January 2006"),
+	}
+}
+
+func cvesHandler(w http.ResponseWriter, r *http.Request) {
+	enableCORS(w, r)
+	if r.Method != "GET" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Return cached data if fresh (within 24 hours)
+	if time.Since(cveCache.timestamp) < 24*time.Hour && len(cveCache.data) > 0 {
+		jsonResponse(w, cveCache.data)
+		return
+	}
+
+	// Fetch new CVE data from NVD
+	cves, err := fetchNVDCVEs()
+	if err != nil {
+		log.Printf("NVD fetch failed: %v", err)
+		if len(cveCache.data) > 0 {
+			jsonResponse(w, cveCache.data) // Fallback to cache
+			return
+		}
+		jsonResponse(w, mockCVEs) // Fallback to mock data
+		return
+	}
+
+	// Update cache
+	cveCache.data = cves
+	cveCache.timestamp = time.Now()
+	jsonResponse(w, cves)
+}
+
+// fetchNVDCVEs fetches CVE data from NVD with pagination and retries
+func fetchNVDCVEs() ([]CVE, error) {
+	const maxRetries = 3
+	const retryDelay = 6 * time.Second // Respect NVD rate limit (5 req/30s without API key)
+	const resultsPerPage = 10
+	startIndex := 0
+	var allCVEs []CVE
+
+	// Calculate valid date range (within 120 days, ending at current date)
+	endDate := time.Now().UTC()
+	startDate := endDate.AddDate(0, 0, -119) // 120-day limit
+	pubStart := startDate.Format("2006-01-02T15:04:05.000Z")
+	pubEnd := endDate.Format("2006-01-02T15:04:05.000Z")
+
+	for {
+		// Construct URL with valid parameters
+		url := fmt.Sprintf(
+			"https://services.nvd.nist.gov/rest/json/cves/2.0?resultsPerPage=%d&startIndex=%d&pubStartDate=%s&pubEndDate=%s&hasKev",
+			resultsPerPage, startIndex, pubStart, pubEnd,
+		)
+
+		var resp *http.Response
+		var err error
+
+		// Retry logic
+		for attempt := 1; attempt <= maxRetries; attempt++ {
+			req, err := http.NewRequest("GET", url, nil)
+			if err != nil {
+				return nil, fmt.Errorf("request creation failed: %v", err)
+			}
+
+			// Add NVD API key if available
+			if nvdAPIKey := os.Getenv("NVD_API_KEY"); nvdAPIKey != "" {
+				req.Header.Add("apiKey", nvdAPIKey)
+			}
+
+			resp, err = httpClient.Do(req)
+			if err != nil {
+				log.Printf("NVD API request failed (attempt %d): %v", attempt, err)
+				if attempt < maxRetries {
+					time.Sleep(retryDelay)
+					continue
+				}
+				return nil, fmt.Errorf("NVD API request failed after %d attempts: %v", maxRetries, err)
+			}
+
+			// Handle non-200 status
+			if resp.StatusCode != http.StatusOK {
+				body, _ := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				if resp.StatusCode == http.StatusNotFound {
+					log.Printf("NVD API returned 404 for startIndex %d", startIndex)
+					if len(allCVEs) > 0 {
+						return allCVEs, nil // Return what we have
+					}
+					// Try broader date range (e.g., last year)
+					url = fmt.Sprintf(
+						"https://services.nvd.nist.gov/rest/json/cves/2.0?resultsPerPage=%d&startIndex=%d&pubStartDate=2023-01-01T00:00:00.000Z&pubEndDate=%s&hasKev",
+						resultsPerPage, startIndex, pubEnd,
+					)
+					if attempt < maxRetries {
+						time.Sleep(retryDelay)
+						continue
+					}
+					return nil, fmt.Errorf("NVD API error: %s, body: %s", resp.Status, string(body))
+				}
+				if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusServiceUnavailable {
+					resp.Body.Close()
+					log.Printf("NVD API returned %d (attempt %d), retrying after delay", resp.StatusCode, attempt)
+					if attempt < maxRetries {
+						time.Sleep(retryDelay)
+						continue
+					}
+					return nil, fmt.Errorf("NVD API error: %s", resp.Status)
+				}
+				resp.Body.Close()
+				return nil, fmt.Errorf("NVD API error: %s, body: %s", resp.Status, string(body))
+			}
+			break
+		}
+
+		defer resp.Body.Close()
+
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read response body: %v", err)
+		}
+
+		// Parse NVD response
+		var nvdResp struct {
+			ResultsPerPage  int `json:"resultsPerPage"`
+			StartIndex      int `json:"startIndex"`
+			TotalResults    int `json:"totalResults"`
+			Vulnerabilities []struct {
+				Cve struct {
+					ID           string `json:"id"`
+					Descriptions []struct {
+						Lang  string `json:"lang"`
+						Value string `json:"value"`
+					} `json:"descriptions"`
+					Published string `json:"published"`
+					Metrics   struct {
+						CvssMetricV31 []struct {
+							CvssData struct {
+								BaseScore float64 `json:"baseScore"`
+							} `json:"cvssData"`
+						} `json:"cvssMetricV31"`
+					} `json:"metrics"`
+					Configurations []struct {
+						Nodes []struct {
+							CpeMatch []struct {
+								Criteria string `json:"criteria"`
+							} `json:"cpeMatch"`
+						} `json:"nodes"`
+					} `json:"configurations"`
+					CisaExploitAdd string `json:"cisaExploitAdd"`
+				} `json:"cve"`
+			} `json:"vulnerabilities"`
+		}
+
+		if err := json.Unmarshal(body, &nvdResp); err != nil {
+			return nil, fmt.Errorf("JSON decode failed: %v, body: %s", err, string(body))
+		}
+
+		// Transform NVD data to CVE struct
+		for _, vuln := range nvdResp.Vulnerabilities {
+			cve := CVE{
+				CVEID:     vuln.Cve.ID,
+				Published: vuln.Cve.Published[:10], // YYYY-MM-DD
+			}
+
+			// Description
+			for _, desc := range vuln.Cve.Descriptions {
+				if desc.Lang == "en" {
+					cve.Description = desc.Value
+					break
+				}
+			}
+			if cve.Description == "" && len(vuln.Cve.Descriptions) > 0 {
+				cve.Description = vuln.Cve.Descriptions[0].Value
+			}
+
+			// CVSS and Severity
+			if len(vuln.Cve.Metrics.CvssMetricV31) > 0 {
+				cve.CVSS = vuln.Cve.Metrics.CvssMetricV31[0].CvssData.BaseScore
+				cve.Severity = cvssToSeverity(cve.CVSS)
+			} else {
+				cve.CVSS = 0.0
+				cve.Severity = "low"
+			}
+
+			// Vendor and Product from CPE
+			for _, config := range vuln.Cve.Configurations {
+				for _, node := range config.Nodes {
+					for _, cpe := range node.CpeMatch {
+						parts := strings.Split(cpe.Criteria, ":")
+						if len(parts) >= 5 {
+							cve.Vendor = strings.ToLower(parts[3])
+							cve.Product = parts[4]
+							break
+						}
+					}
+					if cve.Vendor != "" {
+						break
+					}
+				}
+				if cve.Vendor != "" {
+					break
+				}
+			}
+			if cve.Vendor == "" {
+				cve.Vendor = "unknown"
+				cve.Product = "Unknown Product"
+			}
+
+			// Status (use hasKev for exploited status)
+			cve.Status = "none"
+			if vuln.Cve.CisaExploitAdd != "" {
+				cve.Status = "exploited"
+			} else if strings.Contains(strings.ToLower(cve.Description), "proof of concept") || strings.Contains(strings.ToLower(cve.Description), "poc") {
+				cve.Status = "poc"
+			}
+
+			allCVEs = append(allCVEs, cve)
+		}
+
+		// Check if more results exist
+		if nvdResp.StartIndex+nvdResp.ResultsPerPage >= nvdResp.TotalResults {
+			break
+		}
+		startIndex += nvdResp.ResultsPerPage
+	}
+
+	if len(allCVEs) == 0 {
+		return nil, fmt.Errorf("no CVEs returned from NVD API")
+	}
+
+	return allCVEs, nil
+}
+
+// cvssToSeverity maps CVSS score to severity
+func cvssToSeverity(cvss float64) string {
+	switch {
+	case cvss >= 9.0:
+		return "critical"
+	case cvss >= 7.0:
+		return "high"
+	case cvss >= 4.0:
+		return "medium"
+	default:
+		return "low"
 	}
 }
