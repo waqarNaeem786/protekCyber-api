@@ -12,6 +12,43 @@ import (
 	"time"
 )
 
+
+type GeoThreat struct {
+	Source    Location `json:"source"`
+	Target    Location `json:"target"`
+	Threat    string   `json:"threat"`
+	Timestamp string   `json:"timestamp"`
+}
+
+type Location struct {
+	City string  `json:"city"`
+	Lon  float64 `json:"lon"`
+	Lat  float64 `json:"lat"`
+}
+
+// AbuseIPDB response struct
+type AbuseIPDBResponse struct {
+	Data struct {
+		IPAddress            string  `json:"ipAddress"`
+		CountryCode          string  `json:"countryCode"`
+		City                 string  `json:"city"`
+		Latitude             float64 `json:"latitude"`
+		Longitude            float64 `json:"longitude"`
+		AbuseConfidenceScore int     `json:"abuseConfidenceScore"`
+		Reports              []struct {
+			ReportedAt string   `json:"reportedAt"`
+			Categories []string `json:"categories"`
+		} `json:"reports"`
+	} `json:"data"`
+}
+
+
+
+
+
+
+
+
 type Threat struct {
 	ID          string   `json:"id"`
 	Name        string   `json:"name"`
@@ -142,6 +179,9 @@ func main() {
 	http.HandleFunc("/health", healthCheck)
 	http.HandleFunc("/api/cves", cvesHandler)
 	http.HandleFunc("/api/all-threats", allThreatsHandler)
+	http.HandleFunc("/api/locationThreats", threatlocation)
+	http.HandleFunc("/api/checkpoint-threats", checkpointThreatsHandler)
+
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
@@ -167,6 +207,7 @@ func enableCORS(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+
 func jsonResponse(w http.ResponseWriter, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "public, max-age=300")
@@ -180,6 +221,84 @@ func healthCheck(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("OK"))
 }
+
+// Add this to your main.go
+func checkpointThreatsHandler(w http.ResponseWriter, r *http.Request) {
+    // Set CORS headers
+    enableCORS(w, r)
+    
+    // Set proper headers for streaming
+    w.Header().Set("Content-Type", "text/event-stream")
+    w.Header().Set("Cache-Control", "no-cache")
+    w.Header().Set("Connection", "keep-alive")
+    w.Header().Set("X-Accel-Buffering", "no") // Disable buffering for Nginx
+    
+    // Create HTTP client with timeout
+    client := &http.Client{
+        Timeout: 0, // No timeout - keep connection open
+    }
+    
+    // Get stream from Check Point API
+    resp, err := client.Get("https://threatmap-api.checkpoint.com/ThreatMap/api/feed")
+    if err != nil {
+        log.Printf("Failed to connect to Check Point API: %v", err)
+        http.Error(w, "Failed to connect to threat feed", http.StatusBadGateway)
+        return
+    }
+    defer resp.Body.Close()
+    
+    // Create a buffer for reading chunks
+    buf := make([]byte, 1024)
+    
+    // Stream the response to client
+    for {
+        n, err := resp.Body.Read(buf)
+        if err != nil {
+            if err != io.EOF {
+                log.Printf("Stream error: %v", err)
+            }
+            break
+        }
+        
+        // Write chunk to client
+        _, err = w.Write(buf[:n])
+        if err != nil {
+            log.Printf("Client disconnected: %v", err)
+            break
+        }
+        
+        // Flush the response
+        if flusher, ok := w.(http.Flusher); ok {
+            flusher.Flush()
+        }
+    }
+    
+    log.Println("Stream completed")
+}
+
+// func checkpointThreatsHandler(w http.ResponseWriter, r *http.Request) {
+//  enableCORS(w, r)
+    
+//     // Set headers for streaming response
+//     w.Header().Set("Content-Type", "text/event-stream")
+//     w.Header().Set("Cache-Control", "no-cache")
+//     w.Header().Set("Connection", "keep-alive")
+    
+//     // Get data from Check Point
+//     resp, err := http.Get("https://threatmap-api.checkpoint.com/ThreatMap/api/feed")
+//     if err != nil {
+//         log.Printf("Error fetching threats: %v", err)
+//         http.Error(w, "Failed to connect to threat feed", http.StatusBadGateway)
+//         return
+//     }
+//     defer resp.Body.Close()
+    
+//     // Stream the response directly to client
+//     _, err = io.Copy(w, resp.Body)
+//     if err != nil {
+//         log.Printf("Stream error: %v", err)
+//     }
+// }
 
 func threatsHandler(w http.ResponseWriter, r *http.Request) {
 	enableCORS(w, r)
@@ -208,6 +327,29 @@ func threatsHandler(w http.ResponseWriter, r *http.Request) {
 	cache.timestamp = time.Now()
 	jsonResponse(w, threats)
 }
+
+func threatlocation(w http.ResponseWriter, r *http.Request) {
+	enableCORS(w, r)
+	rawThreats, err := fetchAbuseIPDBThreats()
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Error fetching threats: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Convert to Threat2 format
+	threats := convertToFrontendFormat(rawThreats)
+
+	// Explicitly encode as Threat2 array
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(threats); err != nil {
+		log.Printf("JSON encode error: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+	}
+}
+
+
+
+
 
 func fetchOTXThreats() ([]Threat, error) {
 	if otxAPIKey == "" {
@@ -647,3 +789,95 @@ func cvssToSeverity(cvss float64) string {
 		return "low"
 	}
 }
+
+func fetchAbuseIPDBThreats() ([]AbuseIPDBResponse, error) {
+	apiKey := os.Getenv("ABUSEIPDB_API_KEY")
+	if apiKey == "" {
+		return nil, fmt.Errorf("ABUSEIPDB_API_KEY environment variable not set")
+	}
+
+	// Example: Fetch recent malicious IPs (adjust URL as needed)
+	url := "https://api.abuseipdb.com/api/v2/recent?limit=10"
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Set("Key", apiKey)
+	req.Header.Set("Accept", "application/json")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var apiResponse struct {
+		Data []AbuseIPDBResponse `json:"data"`
+	}
+	if err := json.Unmarshal(body, &apiResponse); err != nil {
+		return nil, err
+	}
+
+	return apiResponse.Data, nil
+}
+
+func convertToFrontendFormat(abuseData []AbuseIPDBResponse) []GeoThreat {
+	var threats []GeoThreat
+	cities := []string{"New York", "London", "Tokyo", "Sydney", "Berlin"} // Fallback cities
+
+	for i, entry := range abuseData {
+		// Use reported city or fallback
+		city := entry.Data.City
+		if city == "" {
+			city = cities[i%len(cities)]
+		}
+
+		// Map AbuseIPDB categories to your threat types
+		threatType := "malware"
+		if len(entry.Data.Reports) > 0 {
+			if contains(entry.Data.Reports[0].Categories, "Phishing") {
+				threatType = "phishing"
+			} else if contains(entry.Data.Reports[0].Categories, "Exploit") {
+				threatType = "exploit"
+			}
+		}
+
+		// Create source (malicious IP) and target (random city)
+		source := Location{
+			City: city,
+			Lon:  entry.Data.Longitude,
+			Lat:  entry.Data.Latitude,
+		}
+
+		targetCity := cities[(i+1)%len(cities)]
+		target := Location{
+			City: targetCity,
+			Lon:  -0.1276, // Example: London's longitude
+			Lat:  51.5074,  // Example: London's latitude
+		}
+
+		threats = append(threats, GeoThreat{
+			Source:    source,
+			Target:    target,
+			Threat:    threatType,
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		})
+	}
+	return threats
+}
+
+// func contains(slice []string, item string) bool {
+// 	for _, s := range slice {
+// 		if s == item {
+// 			return true
+// 		}
+// 	}
+// 	return false
+// }
