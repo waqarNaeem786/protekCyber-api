@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"bufio"
 )
 
 
@@ -185,99 +186,149 @@ func healthCheck(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("OK"))
 }
 
-// Add this to your main.go
+
 func checkpointThreatsHandler(w http.ResponseWriter, r *http.Request) {
-	// Set CORS headers
 	enableCORS(w, r)
-	
-	// Set proper headers for streaming
+
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no") // Disable buffering for Nginx
-	w.Header().Set("Transfer-Encoding", "chunked")	
-	// Create HTTP client with timeout
-	client := &http.Client{
-		Timeout: 0, // No timeout - keep connection open
-	}
-	
-	// Get stream from Check Point API
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	client := &http.Client{Timeout: 0}
+
 	resp, err := client.Get("https://threatmap-api.checkpoint.com/ThreatMap/api/feed")
 	if err != nil {
-		log.Printf("Failed to connect to Check Point API: %v", err)
 		http.Error(w, "Failed to connect to threat feed", http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
-	
-	// Create a buffer for reading chunks
-	buf := make([]byte, 1024)
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "Streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+
+	// Heartbeat goroutine
 	go func() {
-		ticker := time.NewTicker(10 * time.Second)
+		ticker := time.NewTicker(3 * time.Second)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
-				_, err := w.Write([]byte("data: \n\n"))
+				_, err := fmt.Fprintf(w, "data: heartbeat %v\n\n", time.Now())
 				if err != nil {
-					log.Printf("Failed to send heartbeat: %v", err)
+					log.Printf("Heartbeat error: %v", err)
 					return
 				}
-				if flusher, ok := w.(http.Flusher); ok {
-					flusher.Flush()
-				}
+				flusher.Flush()
 			}
 		}
 	}()
-	// Stream the response to client
-	for {
-		n, err := resp.Body.Read(buf)
+
+	// Line-based scanner
+	scanner := bufio.NewScanner(resp.Body)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			continue
+		}
+
+		_, err := fmt.Fprintf(w, "data: %s\n\n", line)
 		if err != nil {
-			if err != io.EOF {
-				log.Printf("Stream error: %v", err)
-			}
+			log.Printf("Write error: %v", err)
 			break
 		}
-		
-		// Write chunk to client
-		_, err = w.Write(buf[:n])
-		if err != nil {
-			log.Printf("Client disconnected: %v", err)
-			break
-		}
-		
-		// Flush the response
-		if flusher, ok := w.(http.Flusher); ok {
-			flusher.Flush()
-		}
+		flusher.Flush()
 	}
-	
-	log.Println("Stream completed")
+
+	if err := scanner.Err(); err != nil {
+		log.Printf("Scanner error: %v", err)
+	}
+
+	log.Println("Stream ended")
 }
 
+
+
+
+
+
+
+
+
+// // add this to your main.go
 // func checkpointThreatsHandler(w http.ResponseWriter, r *http.Request) {
-//  enableCORS(w, r)
-    
-//     // Set headers for streaming response
-//     w.Header().Set("Content-Type", "text/event-stream")
-//     w.Header().Set("Cache-Control", "no-cache")
-//     w.Header().Set("Connection", "keep-alive")
-    
-//     // Get data from Check Point
-//     resp, err := http.Get("https://threatmap-api.checkpoint.com/ThreatMap/api/feed")
-//     if err != nil {
-//         log.Printf("Error fetching threats: %v", err)
-//         http.Error(w, "Failed to connect to threat feed", http.StatusBadGateway)
-//         return
-//     }
-//     defer resp.Body.Close()
-    
-//     // Stream the response directly to client
-//     _, err = io.Copy(w, resp.Body)
-//     if err != nil {
-//         log.Printf("Stream error: %v", err)
-//     }
+// 	// Set CORS headers
+// 	enableCORS(w, r)
+	
+// 	// Set proper headers for streaming
+// 	w.Header().Set("Content-Type", "text/event-stream")
+// 	w.Header().Set("Cache-Control", "no-cache")
+// 	w.Header().Set("Connection", "keep-alive")
+// 	w.Header().Set("X-Accel-Buffering", "no") // Disable buffering for Nginx
+// 	w.Header().Set("Transfer-Encoding", "chunked")	
+// 	// Create HTTP client with timeout
+// 	client := &http.Client{
+// 		Timeout: 0, // No timeout - keep connection open
+// 	}
+	
+// 	// Get stream from Check Point API
+// 	resp, err := client.Get("https://threatmap-api.checkpoint.com/ThreatMap/api/feed")
+// 	if err != nil {
+// 		log.Printf("Failed to connect to Check Point API: %v", err)
+// 		http.Error(w, "Failed to connect to threat feed", http.StatusBadGateway)
+// 		return
+// 	}
+// 	defer resp.Body.Close()
+	
+// 	// Create a buffer for reading chunks
+// 	buf := make([]byte, 1024)
+// 	go func() {
+// 		ticker := time.NewTicker(10 * time.Second)
+// 		defer ticker.Stop()
+// 		for {
+// 			select {
+// 			case <-ticker.C:
+// 				_, err := w.Write([]byte("data: \n\n"))
+// 				if err != nil {
+// 					log.Printf("Failed to send heartbeat: %v", err)
+// 					return
+// 				}
+// 				if flusher, ok := w.(http.Flusher); ok {
+// 					flusher.Flush()
+// 				}
+// 			}
+// 		}
+// 	}()
+// 	// Stream the response to client
+// 	for {
+// 		n, err := resp.Body.Read(buf)
+// 		if err != nil {
+// 			if err != io.EOF {
+// 				log.Printf("Stream error: %v", err)
+// 			}
+// 			break
+// 		}
+		
+// 		// Write chunk to client
+// 		_, err = w.Write(buf[:n])
+// 		if err != nil {
+// 			log.Printf("Client disconnected: %v", err)
+// 			break
+// 		}
+		
+// 		// Flush the response
+// 		if flusher, ok := w.(http.Flusher); ok {
+// 			flusher.Flush()
+// 		}
+// 	}
+	
+// 	log.Println("Stream completed")
 // }
+
+
 
 func threatsHandler(w http.ResponseWriter, r *http.Request) {
 	enableCORS(w, r)
