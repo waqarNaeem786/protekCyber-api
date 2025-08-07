@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 	"bufio"
+	"github.com/gorilla/websocket"
 )
 
 
@@ -144,8 +145,10 @@ func main() {
 	http.HandleFunc("/health", healthCheck)
 	http.HandleFunc("/api/cves", cvesHandler)
 	http.HandleFunc("/api/all-threats", allThreatsHandler)
-	http.HandleFunc("/api/checkpoint-threats", checkpointThreatsHandler)
+	// http.HandleFunc("/api/checkpoint-threats", checkpointThreatsHandler)
+	http.HandleFunc("/ws/check-threats", threatWebSocketHandler)
 
+	log.Println("WebSocket server started on :8080")
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
@@ -187,71 +190,71 @@ func healthCheck(w http.ResponseWriter, r *http.Request) {
 }
 
 
-func checkpointThreatsHandler(w http.ResponseWriter, r *http.Request) {
-	enableCORS(w, r)
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool {
+		return true // allow all origins (optional: secure for production)
+	},
+}
 
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no")
 
-	client := &http.Client{Timeout: 0}
-
-	resp, err := client.Get("https://threatmap-api.checkpoint.com/ThreatMap/api/feed")
+func threatWebSocketHandler(w http.ResponseWriter, r *http.Request) {
+	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		http.Error(w, "Failed to connect to threat feed", http.StatusBadGateway)
+		log.Printf("WebSocket upgrade failed: %v", err)
+		return
+	}
+	defer conn.Close()
+
+	// Setup read deadline to detect dead clients
+	conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	conn.SetPongHandler(func(appData string) error {
+		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		return nil
+	})
+
+	// Ping keep-alive goroutine
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Println("Recovered from panic in ping goroutine:", r)
+			}
+		}()
+
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				log.Println("Ping failed:", err)
+				return
+			}
+			<-ticker.C
+		}
+	}()
+
+	// Connect to the Check Point API stream
+	resp, err := http.Get("https://threatmap-api.checkpoint.com/ThreatMap/api/feed")
+	if err != nil {
+		log.Printf("Failed to connect to Check Point API: %v", err)
 		return
 	}
 	defer resp.Body.Close()
 
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		http.Error(w, "Streaming unsupported", http.StatusInternalServerError)
-		return
-	}
-
-	// Heartbeat goroutine
-	go func() {
-		ticker := time.NewTicker(3 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				_, err := fmt.Fprintf(w, "data: heartbeat %v\n\n", time.Now())
-				if err != nil {
-					log.Printf("Heartbeat error: %v", err)
-					return
-				}
-				flusher.Flush()
-			}
-		}
-	}()
-
-	// Line-based scanner
+	// Stream data line-by-line
 	scanner := bufio.NewScanner(resp.Body)
 	for scanner.Scan() {
 		line := scanner.Text()
-		if line == "" {
-			continue
+		if line != "" {
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(line)); err != nil {
+				log.Println("WebSocket write failed:", err)
+				break
+			}
 		}
-
-		_, err := fmt.Fprintf(w, "data: %s\n\n", line)
-		if err != nil {
-			log.Printf("Write error: %v", err)
-			break
-		}
-		flusher.Flush()
 	}
-
 	if err := scanner.Err(); err != nil {
-		log.Printf("Scanner error: %v", err)
+		log.Println("Scanner error:", err)
 	}
-
-	log.Println("Stream ended")
 }
-
-
-
 
 
 
