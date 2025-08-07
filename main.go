@@ -212,7 +212,23 @@ func checkpointThreatsHandler(w http.ResponseWriter, r *http.Request) {
 	
 	// Create a buffer for reading chunks
 	buf := make([]byte, 1024)
-	
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				_, err := w.Write([]byte("data: \n\n"))
+				if err != nil {
+					log.Printf("Failed to send heartbeat: %v", err)
+					return
+				}
+				if flusher, ok := w.(http.Flusher); ok {
+					flusher.Flush()
+				}
+			}
+		}
+	}()
 	// Stream the response to client
 	for {
 		n, err := resp.Body.Read(buf)
